@@ -1,0 +1,15 @@
+.venv/
+venv/
+stitch_env/
+miniconda/
+__pycache__/
+*.jpg
+*.png
+*.mp4
+*.zip
+*.tar.gz
+17/
+18/
+old/
+scratch/
+.antigravity_rules
