@@ -1,11 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
-import 'dart:ui' as ui;
 
-import 'package:camera/camera.dart';
-import 'package:exif/exif.dart';
-import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 import 'package:path/path.dart' as path;
@@ -18,9 +15,13 @@ enum ScanState { initializing, ready, scanning, completed, error }
 
 /// Controller managing the full 360° panorama capture flow.
 ///
+/// Uses **native Camera2 API** to discover all cameras via
+/// [CameraManager.getCameraIdList()] and identify wide-angle lenses
+/// through [LENS_INFO_AVAILABLE_FOCAL_LENGTHS].
+///
 /// Supports two grid densities:
-///   - **Main camera** (1x, HFOV ≈ 65°): 52-point grid across 7 rows
-///   - **Wide-angle camera** (0.5x, HFOV ≈ 120°): 22-point grid across 5 rows
+///   - **Main camera** (1x, HFOV ≈ 65°): 33-point grid across 5 rows
+///   - **Wide-angle camera** (0.5x, HFOV ≈ 120°): 33-point grid across 5 rows
 ///
 /// Auto-captures when the device is held stable and aligned with a target cell.
 class ScanRawController extends GetxController {
@@ -28,39 +29,38 @@ class ScanRawController extends GetxController {
     : _repository = repository;
 
   final IPanoramaRepository _repository;
-  CameraController? cameraController;
 
   // ── Grid configurations ────────────────────────────────────────────
 
-  /// Main camera grid (1x): 40 points across 5 rows.
-  /// Designed for HFOV ≈ 65° with ≥30% overlap between adjacent frames.
+  /// Main camera grid (1x): 33 points across 5 rows.
+  /// Staggered 'Diamond' pattern: Horizon has more points than Top/Bottom.
   ///
-  ///   Row 0  Zenith (+90°) :  1 point   (single cap)
-  ///   Row 1  Top    (+35°) : 12 points  (staggered vs horizon)
-  ///   Row 2  Horizon ( 0°) : 14 points  (densest, reference)
-  ///   Row 3  Bottom (-35°) : 12 points  (staggered vs horizon)
-  ///   Row 4  Nadir  (-90°) :  1 point   (single cap)
+  ///   Row 0  Zenith (+90°) :  1 point
+  ///   Row 1  Top    (+35°) : 10 points  (staggered in Row 2 gaps)
+  ///   Row 2  Horizon ( 0°) : 11 points  (reference)
+  ///   Row 3  Bottom (-35°) : 10 points  (staggered in Row 2 gaps)
+  ///   Row 4  Nadir  (-90°) :  1 point
   static const List<Map<String, dynamic>> _mainCameraGrid = [
     {'pitch': 90.0,  'count': 1,  'yawOffset': 0.0},
-    {'pitch': 35.0,  'count': 12, 'yawOffset': 15.0},
-    {'pitch': 0.0,   'count': 14, 'yawOffset': 0.0},
-    {'pitch': -35.0, 'count': 12, 'yawOffset': 15.0},
+    {'pitch': 35.0,  'count': 10, 'yawOffset': 16.36},
+    {'pitch': 0.0,   'count': 11, 'yawOffset': 0.0},
+    {'pitch': -35.0, 'count': 10, 'yawOffset': 16.36},
     {'pitch': -90.0, 'count': 1,  'yawOffset': 0.0},
   ];
 
-  /// Wide-angle camera grid (0.5x): 30 points across 5 rows.
-  /// Matches the sample app layout for HFOV ≈ 120°.
+  /// Wide-angle camera grid (0.5x): 33 points across 5 rows.
+  /// Optimized for HFOV ≈ 120°.
   ///
   ///   Row 0  Zenith (+90°) :  1 point
-  ///   Row 1  Top    (+45°) :  8 points  (staggered vs row 2)
-  ///   Row 2  Horizon ( 0°) : 12 points  (reference)
-  ///   Row 3  Bottom (-45°) :  8 points  (staggered vs row 2)
+  ///   Row 1  Top    (+45°) : 10 points  (staggered)
+  ///   Row 2  Horizon ( 0°) : 11 points  (reference)
+  ///   Row 3  Bottom (-45°) : 10 points  (staggered)
   ///   Row 4  Nadir  (-90°) :  1 point
   static const List<Map<String, dynamic>> _wideCameraGrid = [
     {'pitch': 90.0,  'count': 1,  'yawOffset': 0.0},
-    {'pitch': 45.0,  'count': 8,  'yawOffset': 22.5},
-    {'pitch': 0.0,   'count': 12, 'yawOffset': 0.0},
-    {'pitch': -45.0, 'count': 8,  'yawOffset': 22.5},
+    {'pitch': 45.0,  'count': 10, 'yawOffset': 16.36},
+    {'pitch': 0.0,   'count': 11, 'yawOffset': 0.0},
+    {'pitch': -45.0, 'count': 10, 'yawOffset': 16.36},
     {'pitch': -90.0, 'count': 1,  'yawOffset': 0.0},
   ];
 
@@ -72,6 +72,25 @@ class ScanRawController extends GetxController {
       isWideAngle.value ? _wideCameraGrid : _mainCameraGrid;
 
   static const double _minCoverage = 0.95;
+
+  // ── Native Camera State ────────────────────────────────────────────
+  /// All discovered cameras from Camera2 API.
+  final discoveredCameras = <CameraLensInfo>[].obs;
+
+  /// Currently selected camera lens info.
+  final selectedCamera = Rxn<CameraLensInfo>();
+
+  /// The main (1x) back camera — longest focal length among back cameras.
+  CameraLensInfo? _mainCamera;
+
+  /// The wide-angle (0.5x) back camera — shortest focal length / widest HFOV.
+  CameraLensInfo? _wideCamera;
+
+  /// Texture ID from native Camera2 preview for Flutter [Texture] widget.
+  final nativeTextureId = (-1).obs;
+
+  /// Whether multiple back cameras are available for lens switching.
+  final hasMultipleLenses = false.obs;
 
   // ── Observables ────────────────────────────────────────────────────
   final scanState = ScanState.initializing.obs;
@@ -92,7 +111,7 @@ class ScanRawController extends GetxController {
 
   /// Sphere grid: true = captured.
   /// Each inner list length matches activeGridLayout[row]['count'].
-  late final RxList<RxList<bool>> sphereGrid;
+  final sphereGrid = <RxList<bool>>[].obs;
 
   // ── Internal ───────────────────────────────────────────────────────
   StreamSubscription<DeviceOrientationData>? _orientationSub;
@@ -121,7 +140,7 @@ class ScanRawController extends GetxController {
   void onClose() {
     _orientationSub?.cancel();
     _stableTimer?.cancel();
-    cameraController?.dispose();
+    _repository.closeNativeCamera();
     super.onClose();
   }
 
@@ -130,55 +149,135 @@ class ScanRawController extends GetxController {
   /// (Re)builds the sphere grid to match the active layout.
   void _buildSphereGrid() {
     final layout = activeGridLayout;
-    sphereGrid = RxList.generate(
+    sphereGrid.assignAll(List.generate(
       layout.length,
       (r) => RxList.generate(layout[r]['count'] as int, (_) => false),
-    );
+    ));
   }
 
-  /// Switches between main camera and wide-angle camera grids.
-  /// Resets the grid so the user starts a fresh capture with the new density.
-  void switchCameraGrid({required bool wideAngle}) {
-    if (isWideAngle.value == wideAngle) return;
-    isWideAngle.value = wideAngle;
-    _buildSphereGrid();
-    capturedFrames.clear();
-    coveragePercent.value = 0.0;
-    _updateNextTarget();
+  int _currentCamIdx = 0;
+
+  /// Cycles through all available back-facing cameras.
+  /// Uses native Camera2 API to physically switch the camera lens.
+  Future<void> switchCameraLens() async {
+    final backCams = discoveredCameras.where((c) => c.isBackFacing).toList();
+    if (backCams.length <= 1) return;
+
+    _currentCamIdx = (_currentCamIdx + 1) % backCams.length;
+    final targetCamera = backCams[_currentCamIdx];
+
+    try {
+      final textureId = await _repository.switchNativeCamera(
+        targetCamera.cameraId,
+      );
+
+      nativeTextureId.value = textureId;
+      selectedCamera.value = targetCamera;
+      isWideAngle.value = targetCamera.isWideAngle;
+
+      // Reset grid for new lens density
+      _buildSphereGrid();
+      capturedFrames.clear();
+      coveragePercent.value = 0.0;
+      _updateNextTarget();
+
+      // Show temporary feedback on current camera
+      Get.snackbar(
+        'Camera Switched',
+        'ID: ${targetCamera.cameraId} (${targetCamera.hfov.round()}° FOV)',
+        snackPosition: SnackPosition.BOTTOM,
+        backgroundColor: Colors.black54,
+        colorText: Colors.white,
+        duration: const Duration(seconds: 2),
+      );
+    } catch (e) {
+      Get.snackbar('Error', e.toString());
+    }
   }
 
-  // ── Initialize Camera + IMU ────────────────────────────────────────
+  // ── Initialize Native Camera + IMU ─────────────────────────────────
 
   Future<void> _initializeSession() async {
     try {
       scanState.value = ScanState.initializing;
 
-      // Initialize Camera
-      final cameras = await availableCameras();
-      if (cameras.isEmpty) throw Exception('No camera found');
-      final backCamera = cameras.firstWhere(
-        (camera) => camera.lensDirection == CameraLensDirection.back,
-        orElse: () => cameras.first,
+      // 1. Discover all cameras via Camera2 API
+      final cameras = await _repository.discoverCameras();
+      discoveredCameras.assignAll(cameras);
+
+      // Log all discovered cameras for debugging
+      for (final cam in cameras) {
+        debugPrint(
+          '[NativeCamera] Discovered: ID=${cam.cameraId} '
+          'facing=${cam.facing} '
+          'focalLengths=${cam.focalLengths} '
+          'HFOV=${cam.hfov.toStringAsFixed(1)}° '
+          'isWideAngle=${cam.isWideAngle} '
+          'maxRes=${cam.maxWidth}x${cam.maxHeight}',
+        );
+      }
+
+      // 2. Identify main and wide-angle back cameras based on HFOV
+      final backCameras = cameras.where((c) => c.isBackFacing).toList();
+      if (backCameras.isEmpty) throw Exception('No back camera found');
+
+      // Sort by HFOV descending (widest first), then by isPhysical (physical first)
+      backCameras.sort((a, b) {
+        final cmp = b.hfov.compareTo(a.hfov);
+        if (cmp != 0) return cmp;
+        if (a.isPhysical != b.isPhysical) return b.isPhysical ? 1 : -1;
+        return 0;
+      });
+
+      // Widest is our "Wide" candidate (e.g. 0.5x)
+      _wideCamera = backCameras.first;
+
+      // Narrowest back camera is our "Main" candidate (e.g. 1x)
+      _mainCamera = backCameras.lastWhere((c) => !c.isWideAngle, orElse: () => backCameras.last);
+
+      // If they are the same, we only have one lens
+      if (_wideCamera?.cameraId == _mainCamera?.cameraId) {
+        _wideCamera = null;
+      }
+
+      hasMultipleLenses.value = _wideCamera != null;
+
+      debugPrint(
+        '[NativeCamera] Main camera: ${_mainCamera?.cameraId} '
+        '(HFOV=${_mainCamera?.hfov.toStringAsFixed(1)}°)',
+      );
+      debugPrint(
+        '[NativeCamera] Wide camera: ${_wideCamera?.cameraId} '
+        '(HFOV=${_wideCamera?.hfov.toStringAsFixed(1)}°)',
       );
 
-      cameraController = CameraController(
-        backCamera,
-        ResolutionPreset.max,
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.jpeg,
+      // 3. Open the wide-angle camera by default if available, otherwise main
+      final startCamera = _wideCamera ?? _mainCamera!;
+      final textureId = await _repository.openNativeCamera(
+        startCamera.cameraId,
       );
-      await cameraController!.initialize();
+      nativeTextureId.value = textureId;
+      selectedCamera.value = startCamera;
+      isWideAngle.value = startCamera == _wideCamera;
+      
+      // Rebuild grid to match the starting lens density
+      _buildSphereGrid();
+      _updateNextTarget();
 
-      // Initialize IMU
+      debugPrint(
+        '[NativeCamera] Opened ${startCamera.zoomLabel} camera ${startCamera.cameraId} → textureId=$textureId',
+      );
+
+      // 4. Initialize IMU
       await _repository.initialize();
 
-      // Prepare storage
+      // 5. Prepare storage
       final timestamp = DateTime.now().millisecondsSinceEpoch;
       final tempDir = Directory.systemTemp;
       sessionDir = Directory('${tempDir.path}/panorama_$timestamp');
       await sessionDir.create();
 
-      // Listen to orientation stream
+      // 6. Listen to orientation stream
       _orientationSub = _repository.orientationStream.listen(
         _onOrientationUpdate,
         onError: (e) {
@@ -257,7 +356,7 @@ class ScanRawController extends GetxController {
     }
   }
 
-  // ── Capture logic ─────────────────────────────────────────────────
+  // ── Capture logic (Native Camera2) ────────────────────────────────
 
   Future<void> _captureCurrentFrame(
     double captureYaw,
@@ -265,87 +364,42 @@ class ScanRawController extends GetxController {
     int row,
     int col,
   ) async {
-    if (_isCapturing || cameraController == null) return;
+    if (_isCapturing) return;
     _isCapturing = true;
 
     try {
-      // 1. Capture Picture
-      final xFile = await cameraController!.takePicture();
-      final File imgFile = File(xFile.path);
-      final Uint8List bytes = await imgFile.readAsBytes();
-
-      // 2. Read EXIF Data for BE Stitching
-      final Map<String, IfdTag> exifData = await readExifFromBytes(bytes);
-      double iso = 0.0;
-      double exposure = 0.0;
-      double aperture = 0.0;
-
-      try {
-        if (exifData.containsKey('EXIF ISOSpeedRatings')) {
-          iso = double.tryParse(
-                exifData['EXIF ISOSpeedRatings']!.toString(),
-              ) ??
-              0.0;
-        }
-        if (exifData.containsKey('EXIF ExposureTime')) {
-          final String expStr = exifData['EXIF ExposureTime']!.toString();
-          if (expStr.contains('/')) {
-            final parts = expStr.split('/');
-            exposure = double.parse(parts[0]) / double.parse(parts[1]);
-          } else {
-            exposure = double.tryParse(expStr) ?? 0.0;
-          }
-        }
-        if (exifData.containsKey('EXIF FNumber')) {
-          final String apStr = exifData['EXIF FNumber']!.toString();
-          if (apStr.contains('/')) {
-            final parts = apStr.split('/');
-            aperture = double.parse(parts[0]) / double.parse(parts[1]);
-          } else {
-            aperture = double.tryParse(apStr) ?? 0.0;
-          }
-        }
-      } catch (e) {
-        print("EXIF extraction error: $e");
-      }
-
-      // 3. Intrinsic Matrix Estimation
-      final double hFov = isWideAngle.value ? 120.0 : 65.0;
-
-      final ui.Codec codec = await ui.instantiateImageCodec(bytes);
-      final ui.FrameInfo frameInfo = await codec.getNextFrame();
-      final double width = frameInfo.image.width.toDouble();
-      final double height = frameInfo.image.height.toDouble();
-
-      final double fx = width / (2 * tan((hFov / 2) * pi / 180.0));
-      final double fy = fx;
-      final double cx = width / 2.0;
-      final double cy = height / 2.0;
-
       final int timestamp = DateTime.now().millisecondsSinceEpoch;
 
-      final String destPath =
-          '${sessionDir.path}/frame_${capturedFrames.length}'
-          '_y${captureYaw.toStringAsFixed(1)}'
-          '_p${capturePitch.toStringAsFixed(1)}'
-          '_r${roll.value.toStringAsFixed(1)}'
-          '_f${fx.toStringAsFixed(1)}'
-          '_t$timestamp.jpg';
+      // Build file path - simplified naming (sequence number only)
+      final String destPath = '${sessionDir.path}/${capturedFrames.length}.jpg';
 
-      await imgFile.copy(destPath);
-      await imgFile.delete();
+      // Capture via native Camera2 API
+      final result = await _repository.captureNativeImage(destPath);
+
+      final bool success = result['success'] as bool? ?? false;
+      if (!success) {
+        debugPrint('[NativeCamera] Capture failed: ${result['error']}');
+        return;
+      }
+
+      // Extract real intrinsics from Camera2 characteristics
+      final double fx = (result['fx'] as num?)?.toDouble() ?? 0.0;
+      final double fy = (result['fy'] as num?)?.toDouble() ?? 0.0;
+      final double cx = (result['cx'] as num?)?.toDouble() ?? 0.0;
+      final double cy = (result['cy'] as num?)?.toDouble() ?? 0.0;
+      final double focalLengthMm =
+          (result['focalLengthMm'] as num?)?.toDouble() ?? 0.0;
+      final double hfov = (result['hfov'] as num?)?.toDouble() ?? 0.0;
 
       final frame = RawFrame(
         index: capturedFrames.length,
+        clusterId: _getClusterId(row, col),
         filePath: destPath,
         yaw: captureYaw,
         pitch: capturePitch,
         roll: roll.value,
-        focalLength: fx,
+        focalLength: focalLengthMm,
         capturedAt: DateTime.now(),
-        iso: iso,
-        exposureTime: exposure,
-        aperture: aperture,
         fx: fx,
         fy: fy,
         cx: cx,
@@ -354,25 +408,23 @@ class ScanRawController extends GetxController {
 
       capturedFrames.add(frame);
 
-      // Lock focus after first frame to maintain sharp depth consistency,
-      // but keep exposure automatic for OpenCV compensation.
-      if (capturedFrames.length == 1) {
-        try {
-          await cameraController!.setFocusMode(FocusMode.auto);
-          await cameraController!.setExposureMode(ExposureMode.auto);
-        } catch (e) {
-          print("Failed to lock focus: $e");
-        }
-      }
-
       sphereGrid[row][col] = true;
       sphereGrid.refresh();
       _updateCoverage();
       _updateNextTarget();
 
       HapticFeedback.mediumImpact();
+
+      debugPrint(
+        '[NativeCamera] Captured frame ${frame.index}: '
+        'yaw=${captureYaw.toStringAsFixed(1)}° '
+        'pitch=${capturePitch.toStringAsFixed(1)}° '
+        'fx=${fx.toStringAsFixed(1)} fy=${fy.toStringAsFixed(1)} '
+        'HFOV=${hfov.toStringAsFixed(1)}° '
+        'focalMm=${focalLengthMm.toStringAsFixed(2)}',
+      );
     } catch (e) {
-      print("Capture failed: $e");
+      debugPrint('[NativeCamera] Capture failed: $e');
     } finally {
       _isCapturing = false;
       _stableStartTime = null;
@@ -407,8 +459,8 @@ class ScanRawController extends GetxController {
   Future<void> stopSession() async {
     _orientationSub?.cancel();
     _stableTimer?.cancel();
-    cameraController?.dispose();
-    cameraController = null;
+    await _repository.closeNativeCamera();
+    nativeTextureId.value = -1;
 
     try {
       await _repository.stopSession();
@@ -436,13 +488,14 @@ class ScanRawController extends GetxController {
   Future<String> _generateMetadataCsv() async {
     final StringBuffer csv = StringBuffer();
     csv.writeln(
-      'filename,yaw,pitch,roll,focal_length,fx,fy,cx,cy,exposure,iso,aperture',
+      'filename,cluster_id,yaw,pitch,roll,focal_length,fx,fy,cx,cy,exposure,iso,aperture',
     );
 
     for (final frame in capturedFrames) {
       final String fileName = path.basename(frame.filePath);
       csv.writeln(
         '$fileName,'
+        '${frame.clusterId},'
         '${frame.yaw.toStringAsFixed(4)},'
         '${frame.pitch.toStringAsFixed(4)},'
         '${frame.roll.toStringAsFixed(4)},'
@@ -467,8 +520,8 @@ class ScanRawController extends GetxController {
   Future<void> cancelSession() async {
     _orientationSub?.cancel();
     _stableTimer?.cancel();
-    cameraController?.dispose();
-    cameraController = null;
+    await _repository.closeNativeCamera();
+    nativeTextureId.value = -1;
 
     try {
       await _repository.stopSession();
@@ -483,20 +536,43 @@ class ScanRawController extends GetxController {
     final layout = activeGridLayout;
     final int rowCount = layout.length;
 
-    // Scanning order: Horizon → Top → Bottom → Zenith → Nadir
-    const rowOrder = [2, 1, 3, 0, 4];
+    // Scanning order: Cluster-based (Vertical Strips)
+    // For each column, capture Horizon (2) -> Top (1) -> Bottom (3)
+    final int colCountInRow2 = layout[2]['count'] as int;
 
-    for (final r in rowOrder) {
-      if (r >= rowCount) continue;
-      final int count = layout[r]['count'] as int;
-      for (int c = 0; c < count; c++) {
-        if (!sphereGrid[r][c]) {
+    for (int j = 0; j < colCountInRow2; j++) {
+      const rowOrder = [2, 1, 3];
+      for (final r in rowOrder) {
+        if (r >= rowCount) continue;
+        final int count = layout[r]['count'] as int;
+        if (j < count && !sphereGrid[r][j]) {
           targetRow.value = r;
-          targetCol.value = c;
+          targetCol.value = j;
           return;
         }
       }
     }
+
+    // Finally Zenith (0) and Nadir (4)
+    if (!sphereGrid[0][0]) {
+      targetRow.value = 0;
+      targetCol.value = 0;
+      return;
+    }
+    if (rowCount > 4 && !sphereGrid[4][0]) {
+      targetRow.value = 4;
+      targetCol.value = 0;
+      return;
+    }
+  }
+
+  /// Calculates a unique cluster ID for grouping frames.
+  /// Middle rows are grouped by column index (0-10).
+  /// Zenith and Nadir are their own clusters.
+  int _getClusterId(int row, int col) {
+    if (row == 0) return 100; // Zenith cluster
+    if (row == 4) return 200; // Nadir cluster
+    return col; // Middle rows grouped by column
   }
 
   int _yawToCol(double y, int row) {
@@ -565,4 +641,3 @@ class ScanRawController extends GetxController {
     return middleComplete || coveragePercent.value >= _minCoverage;
   }
 }
-
