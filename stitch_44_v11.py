@@ -16,6 +16,7 @@ except ImportError:
 import csv
 from pathlib import Path
 from scipy.optimize import least_squares
+from concurrent.futures import ThreadPoolExecutor
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -85,7 +86,7 @@ def get_sift_matches(img1, img2, match_max_dim=1600):
     
     return mkpts0, mkpts1, mconf
 
-def get_matches(matcher, img1, img2, device, match_max_dim=1200):
+def get_matches(matcher, img1, img2, device, match_max_dim=800):
     if not TORCH_AVAILABLE:
         return get_sift_matches(img1, img2, match_max_dim)
         
@@ -120,8 +121,6 @@ def get_matches(matcher, img1, img2, device, match_max_dim=1200):
     
     # Free GPU memory immediately
     del t_img1, t_img2, input_dict, correspondences
-    if device is not None and device.type == "cuda":
-        torch.cuda.empty_cache()
     
     if len(mkpts0) > 0:
         mkpts0[:, 0] *= (w1 / new_w1)
@@ -220,6 +219,7 @@ def solve_global_bundle(frames, edges, K_opt):
     initial_y = np.array([f["y"] for f in frames])
     initial_p = np.array([f["p"] for f in frames])
     initial_r = np.array([f["r"] for f in frames])
+    cluster_ids = np.array([f["cluster_id"] for f in frames])
     initial_f = K_opt[0, 0]
     cx, cy = K_opt[0, 2], K_opt[1, 2]
 
@@ -495,23 +495,42 @@ def main():
         meta["path"] = f
         meta["row"] = get_row_name(meta["p"])
         
-        cid = csv_meta[f.name].get("cluster_id", -1)
-        if cid == -1:
-            # Fallback for 44-point layout without cluster_ids in csv
-            fid = meta["id"]
-            if fid < 42:
-                cid = fid % 14
-            elif fid == 42:
-                cid = 100 # Zenith
-            elif fid == 43:
-                cid = 200 # Nadir
-                
-        meta["cluster_id"] = cid
+        # Zenith/Nadir special handling
+        if meta["row"] == "Zenith":
+            meta["cluster_id"] = 100
+        elif meta["row"] == "Nadir":
+            meta["cluster_id"] = 200
+        else:
+            meta["cluster_id"] = -1
+            
         frames_meta.append(meta)
             
     if not frames_meta:
         logging.error("No valid frames found!")
         return
+
+    # 1b. Improved Clustering by Yaw Proximity
+    normal_frames = [f for f in frames_meta if f["cluster_id"] == -1]
+    if normal_frames:
+        # Sort by yaw to find groups
+        normal_frames.sort(key=lambda x: x["y"])
+        
+        current_cid = 0
+        last_yaw = normal_frames[0]["y"]
+        
+        for f in normal_frames:
+            # If yaw jump is more than 15 degrees, it's a new cluster
+            # Handle wrap-around manually or just rely on the sorted order for simple clustering
+            diff = abs(f["y"] - last_yaw)
+            if diff > 180: diff = 360 - diff
+            
+            if diff > 15.0: # New column
+                current_cid += 1
+                
+            f["cluster_id"] = current_cid
+            last_yaw = f["y"]
+        
+        logging.info(f"[INFO] Grouped {len(normal_frames)} frames into {current_cid + 1} vertical clusters based on yaw.")
 
     frames_meta.sort(key=lambda x: x["id"])
     
@@ -569,9 +588,10 @@ def main():
     
     for cid, indices in clusters.items():
         if cid < 0: continue # Skip if no cluster
-        for i in range(len(indices)):
-            for j in range(i + 1, len(indices)):
-                match_and_add(indices[i], indices[j])
+        # Sort by pitch to match only neighbors
+        indices.sort(key=lambda idx: frames_meta[idx]["p"])
+        for i in range(len(indices) - 1):
+            match_and_add(indices[i], indices[i+1])
                 
     # 2. Inter-cluster matches (Horizontal)
     # Sort normal clusters by yaw to find neighbors
@@ -579,21 +599,18 @@ def main():
                              key=lambda cid: np.mean([frames_meta[i]["y"] for i in clusters[cid]]))
     
     for i in range(len(normal_clusters)):
-        for j in [1, 2]: # Match with next 2 clusters to increase connectivity
-            cid1 = normal_clusters[i]
-            cid2 = normal_clusters[(i + j) % len(normal_clusters)]
-            
-            # Match corresponding rows between clusters
-            for idx1 in clusters[cid1]:
-                f1 = frames_meta[idx1]
-                # Find best match in next cluster by pitch
-                for idx2 in clusters[cid2]:
-                    f2 = frames_meta[idx2]
-                    if f1["row"] == f2["row"]:
-                        match_and_add(idx1, idx2)
-                    # Also try cross-row matching for stability
-                    elif abs(f1["p"] - f2["p"]) < 40:
-                        match_and_add(idx1, idx2)
+        cid1 = normal_clusters[i]
+        cid2 = normal_clusters[(i + 1) % len(normal_clusters)]
+        
+        # Match corresponding rows between clusters
+        for idx1 in clusters[cid1]:
+            f1 = frames_meta[idx1]
+            # Find best match in next cluster by pitch
+            for idx2 in clusters[cid2]:
+                f2 = frames_meta[idx2]
+                # Only match if pitch is similar (within 20 degrees)
+                if abs(f1["p"] - f2["p"]) < 20:
+                    match_and_add(idx1, idx2)
         
     # 3. Zenith/Nadir matches
     zen_indices = [i for i, f in enumerate(frames_meta) if f["row"] == "Zenith"]
@@ -601,12 +618,29 @@ def main():
     top_indices = [i for i, f in enumerate(frames_meta) if f["row"] == "Top"]
     bot_indices = [i for i, f in enumerate(frames_meta) if f["row"] == "Bottom"]
     
+    # Zenith to Top
     for z_idx in zen_indices:
+        fz = frames_meta[z_idx]
         for t_idx in top_indices:
-            match_and_add(z_idx, t_idx)
+            ft = frames_meta[t_idx]
+            # Only match if yaw is somewhat close
+            y_diff = abs(fz["y"] - ft["y"])
+            if y_diff > 180: y_diff = 360 - y_diff
+            if y_diff < 60:
+                match_and_add(z_idx, t_idx)
+                
+    # Nadir to Bottom
     for n_idx in nad_indices:
+        fn = frames_meta[n_idx]
         for b_idx in bot_indices:
-            match_and_add(n_idx, b_idx)
+            fb = frames_meta[b_idx]
+            y_diff = abs(fn["y"] - fb["y"])
+            if y_diff > 180: y_diff = 360 - y_diff
+            if y_diff < 60:
+                match_and_add(n_idx, b_idx)
+
+    if device and device.type == "cuda":
+        torch.cuda.empty_cache()
 
     logging.info(f"[INFO] Global Bundle Adjustment with {len(all_edges)} match pairs...")
     opt_y, opt_p, opt_r, opt_f = solve_global_bundle(frames_meta, all_edges, K_opt)
@@ -625,45 +659,48 @@ def main():
     out_w = args.width
     out_h = out_w // 2
     target_focal = out_w / (2 * np.pi)
-    warper = cv2.PyRotationWarper("spherical", target_focal)
-    
     logging.info("[INFO] Warping frames to Spherical Panorama...")
     
+    def warp_frame(m):
+        warper = cv2.PyRotationWarper("spherical", target_focal)
+        img = images_dict[m["id"]]
+        work_focal = m["f"] * args.scale
+        work_scale = target_focal / work_focal
+        interp = cv2.INTER_AREA if work_scale < 1.0 else cv2.INTER_LANCZOS4
+        img_resized = cv2.resize(img, (0,0), fx=work_scale, fy=work_scale, interpolation=interp)
+        
+        K = np.array([[target_focal, 0, img_resized.shape[1]/2], [0, target_focal, img_resized.shape[0]/2], [0, 0, 1]], dtype=np.float32)
+        R = get_rotation_matrix(m["y"], m["p"], m["r"])
+        
+        corner, warped = warper.warp(img_resized, K, R, cv2.INTER_LANCZOS4, cv2.BORDER_REFLECT)
+        
+        base_mask = mask_for_row(m["row"], img_resized.shape[0], img_resized.shape[1])
+        _, mask = warper.warp(base_mask, K, R, cv2.INTER_NEAREST, cv2.BORDER_CONSTANT)
+        
+        # Relaxed vertical trimming to avoid gaps
+        if m["row"] in ["Zenith"]:
+            global_max_y = int(out_h * 0.35)
+            local_max_y = global_max_y - corner[1]
+            if 0 < local_max_y < mask.shape[0]: mask[local_max_y:, :] = 0
+        elif m["row"] in ["Nadir"]:
+            global_min_y = int(out_h * 0.65)
+            local_min_y = global_min_y - corner[1]
+            if 0 < local_min_y < mask.shape[0]: mask[:local_min_y, :] = 0
+            
+        return m["cluster_id"], warped, mask, corner
+
     # Store by cluster for hierarchical blending
     cluster_data = {} # {cluster_id: {"imgs": [], "msks": [], "corners": []}}
     all_warped_imgs = [] 
     all_warped_msks = []
     all_corners = []
     
-    for m in frames_meta:
-        img = images_dict[m["id"]]
-        cid = m["cluster_id"]
+    with ThreadPoolExecutor() as executor:
+        results = list(executor.map(warp_frame, frames_meta))
+        
+    for cid, warped, mask, corner in results:
         if cid not in cluster_data:
             cluster_data[cid] = {"imgs": [], "msks": [], "corners": []}
-        
-        work_focal = m["f"] * args.scale
-        work_scale = target_focal / work_focal
-        interp = cv2.INTER_AREA if work_scale < 1.0 else cv2.INTER_LANCZOS4
-        img = cv2.resize(img, (0,0), fx=work_scale, fy=work_scale, interpolation=interp)
-        
-        K = np.array([[target_focal, 0, img.shape[1]/2], [0, target_focal, img.shape[0]/2], [0, 0, 1]], dtype=np.float32)
-        R = get_rotation_matrix(m["y"], m["p"], m["r"])
-        
-        corner, warped = warper.warp(img, K, R, cv2.INTER_LANCZOS4, cv2.BORDER_REFLECT)
-        
-        base_mask = mask_for_row(m["row"], img.shape[0], img.shape[1])
-        _, mask = warper.warp(base_mask, K, R, cv2.INTER_NEAREST, cv2.BORDER_CONSTANT)
-        
-        # Relaxed vertical trimming to avoid gaps
-        if m["row"] in ["Zenith"]:
-            global_max_y = int(out_h * 0.35) # Increased from 0.25
-            local_max_y = global_max_y - corner[1]
-            if 0 < local_max_y < mask.shape[0]: mask[local_max_y:, :] = 0
-        elif m["row"] in ["Nadir"]:
-            global_min_y = int(out_h * 0.65) # Decreased from 0.75
-            local_min_y = global_min_y - corner[1]
-            if 0 < local_min_y < mask.shape[0]: mask[:local_min_y, :] = 0
-        
         cluster_data[cid]["imgs"].append(warped)
         cluster_data[cid]["msks"].append(mask)
         cluster_data[cid]["corners"].append(corner)
@@ -696,7 +733,7 @@ def main():
         logging.info(f"[INFO] Processing cluster: {cid} ({len(data['imgs'])} images)...")
         
         if len(data["imgs"]) > 1:
-            cmsks = find_seams(data["imgs"], data["msks"], data["corners"], scale=0.3, seam_type=cv2.detail.SeamFinder_DP_SEAM)
+            cmsks = find_seams(data["imgs"], data["msks"], data["corners"], scale=0.15, seam_type=cv2.detail.SeamFinder_DP_SEAM)
         else:
             cmsks = data["msks"]
             
@@ -717,7 +754,7 @@ def main():
 
     # Step 6b: Inter-cluster seams using smooth proxies
     logging.info("[INFO] Finding seams between smooth cluster proxies...")
-    final_cluster_masks = find_seams(cluster_proxies, cluster_proxy_masks, cluster_proxy_corners, scale=0.2, seam_type=cv2.detail.SeamFinder_DP_SEAM)
+    final_cluster_masks = find_seams(cluster_proxies, cluster_proxy_masks, cluster_proxy_corners, scale=0.15, seam_type=cv2.detail.SeamFinder_DP_SEAM)
     
     del cluster_proxies
     del cluster_proxy_masks
