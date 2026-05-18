@@ -1,0 +1,3 @@
+C:/Project/build/CMakeFiles/stitch_44v11.dir
+C:/Project/build/CMakeFiles/edit_cache.dir
+C:/Project/build/CMakeFiles/rebuild_cache.dir
